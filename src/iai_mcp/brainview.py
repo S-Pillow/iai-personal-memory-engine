@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -1348,6 +1349,8 @@ class BrainView:
             s.connect(_addr)
             send_sync_auth_token(s)
             req = {"type": ctype, "ts": datetime.now(timezone.utc).isoformat()}
+            if ctype == "user_initiated_sleep":
+                req["reason"] = "brainview-user-request"
             s.sendall((json.dumps(req) + "\n").encode("utf-8"))
             buf = b""
             while not buf.endswith(b"\n") and len(buf) < 65536:
@@ -1384,6 +1387,14 @@ class BrainView:
             else:  # start: never force-kill a running/mid-boot daemon
                 cmd = ["launchctl", "kickstart", target]
         elif sysname == "Linux":
+            # Containerized BrainView must not attempt host/user systemd.
+            # Process lifecycle belongs to the container supervisor.
+            if Path("/.dockerenv").exists() or os.environ.get("container"):
+                return {
+                    "status": "external_manager",
+                    "action": action,
+                    "reason": "daemon lifecycle is managed by the container runtime",
+                }
             cmd = ["systemctl", "--user", action, "iai-mcp-daemon.service"]
         else:
             return {"status": "error", "reason": f"unsupported platform {sysname}"}
