@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import re
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 
 _IOREG_BIN = "/usr/sbin/ioreg"
@@ -30,6 +32,12 @@ _PMSET_SLEEP_MARKERS = ("System Sleep", "Display is turned off")
 _PMSET_DEFAULT_WINDOW_MIN = 5
 
 _HID_IDLE_THRESHOLD_SEC = 30 * 60
+
+_EXTERNAL_IDLE_PATH_ENV = "IAI_MCP_EXTERNAL_IDLE_PATH"
+
+_EXTERNAL_IDLE_MAX_AGE_SEC = 90.0
+
+_EXTERNAL_IDLE_FUTURE_SKEW_SEC = 5.0
 
 #: Distinguishes "no precomputed idle passed" from a passed None (source
 #: reachable but not idle, or source absent).
@@ -74,6 +82,57 @@ class IdleStatus:
 
 
 class IdleDetector:
+
+
+    def _external_idle_time_sec(self) -> int | None:
+        """Read an opt-in external host-idle observation.
+
+        This is an integration seam for containerized/headless deployments
+        where the daemon cannot see the human's desktop session through
+        platform-native APIs such as systemd-logind. Missing, malformed,
+        stale, or future-invalid observations are ignored so they can never
+        manufacture idle time.
+        """
+        raw_path = os.environ.get(_EXTERNAL_IDLE_PATH_ENV)
+        if not raw_path:
+            return None
+
+        try:
+            payload = json.loads(Path(raw_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        schema_version = payload.get("schema_version")
+        if type(schema_version) is not int or schema_version != 1:
+            return None
+
+        raw_idle = payload.get("idle_sec")
+        if isinstance(raw_idle, bool) or not isinstance(raw_idle, (int, float)):
+            return None
+        idle_sec = float(raw_idle)
+        if not math.isfinite(idle_sec) or idle_sec < 0.0:
+            return None
+
+        observed_raw = payload.get("observed_at")
+        if not isinstance(observed_raw, str):
+            return None
+        try:
+            observed = datetime.fromisoformat(observed_raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if observed.tzinfo is None:
+            return None
+        observed = observed.astimezone(timezone.utc)
+
+        age_sec = (datetime.now(timezone.utc) - observed).total_seconds()
+        if age_sec < -_EXTERNAL_IDLE_FUTURE_SKEW_SEC:
+            return None
+        if age_sec > _EXTERNAL_IDLE_MAX_AGE_SEC:
+            return None
+
+        return int(idle_sec)
 
 
     def hid_idle_time_sec(self) -> int | None:
@@ -215,12 +274,17 @@ class IdleDetector:
         consumers that only need ``idle_seconds`` (e.g. ``sleep_eligible``)
         are fully platform-agnostic -- they never inspect ``source_name``.
         ``source_name`` itself is a platform-specific label (``"HIDIdleTime"``,
-        ``"logind"``), set whenever the underlying source was reachable even
-        if ``idle_seconds`` is ``None`` (session not currently idle); it
-        exists for diagnostic/reporting consumers (``status()``,
-        ``describe()``), which is also where any source-name-specific
-        formatting belongs -- not in a caller of this class.
+        ``"logind"``, ``"external_idle_file"``), set whenever the underlying
+        source was reachable even if ``idle_seconds`` is ``None`` (session not
+        currently idle); it exists for diagnostic/reporting consumers
+        (``status()``, ``describe()``), which is also where any source-name-
+        specific formatting belongs -- not in a caller of this class.
         """
+        if os.environ.get(_EXTERNAL_IDLE_PATH_ENV):
+            external_idle = self._external_idle_time_sec()
+            if external_idle is not None:
+                return external_idle, "external_idle_file"
+
         system = platform.system()
         if system == "Darwin":
             idle_sec = self.hid_idle_time_sec()
@@ -275,8 +339,9 @@ class IdleDetector:
     def describe(self) -> tuple[str, str]:
         """Human-readable ``(detail, status)`` for doctor's idle-source
         health check. Callers don't need to know which platform-specific
-        backend (HIDIdleTime, logind, ...) is actually in use -- that
-        knowledge stays here, next to the platform dispatch itself.
+        backend (HIDIdleTime, logind, external host evidence, ...) is actually
+        in use -- that knowledge stays here, next to the platform dispatch
+        itself.
         """
         status = self.status()
 
@@ -292,6 +357,12 @@ class IdleDetector:
         )
         pmset_str = "recent-sleep" if status.pmset_recent_sleep else "clean"
 
+        if "external_idle_file" in status.available_signals:
+            detail = (
+                f"external host idle: {idle_str('unavailable')}, "
+                f"available: {signals_str}"
+            )
+            return detail, "PASS"
         if "HIDIdleTime" in status.available_signals:
             detail = (
                 f"HIDIdleTime: {idle_str('unavailable')}, pmset: {pmset_str}, "
