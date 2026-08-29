@@ -1,0 +1,16 @@
+diff --git a/src/iai_mcp/daemon/__init__.py b/src/iai_mcp/daemon/__init__.py
+--- a/src/iai_mcp/daemon/__init__.py
++++ b/src/iai_mcp/daemon/__init__.py
+@@
+-    for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
++    # SIGHUP is not defined by Python's signal module on Windows. Resolve it
++    # lazily so tuple/list construction itself cannot abort daemon startup.
++    _trace_signals = [signal.SIGTERM, signal.SIGINT]
++    _sighup = getattr(signal, "SIGHUP", None)
++    if _sighup is not None:
++        _trace_signals.append(_sighup)
++    for _sig in _trace_signals:
+         try:
+             signal.signal(_sig, _trace)
+         except (AttributeError, ValueError, OSError):
+             pass
